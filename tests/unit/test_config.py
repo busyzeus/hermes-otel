@@ -18,6 +18,10 @@ _ENV_VARS = [
     "HERMES_OTEL_ROOT_SPAN_TTL_MS",
     "HERMES_OTEL_FLUSH_INTERVAL_MS",
     "HERMES_OTEL_PREVIEW_MAX_CHARS",
+    "HERMES_OTEL_TOOL_INPUT_PREVIEW_MAX_CHARS",
+    "HERMES_OTEL_TOOL_OUTPUT_PREVIEW_MAX_CHARS",
+    "HERMES_OTEL_LLM_INPUT_PREVIEW_MAX_CHARS",
+    "HERMES_OTEL_LLM_OUTPUT_PREVIEW_MAX_CHARS",
     "HERMES_OTEL_CAPTURE_PREVIEWS",
     "HERMES_OTEL_PROJECT_NAME",
     "HERMES_OTEL_SPAN_BATCH_MAX_QUEUE_SIZE",
@@ -44,6 +48,10 @@ class TestDefaults:
         assert cfg.root_span_ttl_ms == 600_000
         assert cfg.flush_interval_ms == 60_000
         assert cfg.preview_max_chars == 1200
+        assert cfg.tool_input_preview_max_chars is None
+        assert cfg.tool_output_preview_max_chars is None
+        assert cfg.llm_input_preview_max_chars is None
+        assert cfg.llm_output_preview_max_chars is None
         assert cfg.capture_previews is True
         assert cfg.headers is None
         assert cfg.global_tags is None
@@ -97,6 +105,26 @@ class TestEnvOverrides:
         monkeypatch.setenv("HERMES_OTEL_PREVIEW_MAX_CHARS", "500")
         cfg = load_config(path=tmp_path / "nonexistent.yaml")
         assert cfg.preview_max_chars == 500
+
+    def test_env_tool_input_preview_max_chars(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_OTEL_TOOL_INPUT_PREVIEW_MAX_CHARS", "800")
+        cfg = load_config(path=tmp_path / "nonexistent.yaml")
+        assert cfg.tool_input_preview_max_chars == 800
+
+    def test_env_tool_output_preview_max_chars(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_OTEL_TOOL_OUTPUT_PREVIEW_MAX_CHARS", "3000")
+        cfg = load_config(path=tmp_path / "nonexistent.yaml")
+        assert cfg.tool_output_preview_max_chars == 3000
+
+    def test_env_llm_input_preview_max_chars(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_OTEL_LLM_INPUT_PREVIEW_MAX_CHARS", "600")
+        cfg = load_config(path=tmp_path / "nonexistent.yaml")
+        assert cfg.llm_input_preview_max_chars == 600
+
+    def test_env_llm_output_preview_max_chars(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_OTEL_LLM_OUTPUT_PREVIEW_MAX_CHARS", "700")
+        cfg = load_config(path=tmp_path / "nonexistent.yaml")
+        assert cfg.llm_output_preview_max_chars == 700
 
     def test_env_project_name(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_OTEL_PROJECT_NAME", "my-project")
@@ -215,6 +243,24 @@ class TestYaml:
         assert cfg.sample_rate == 0.9
         # yaml-only field preserved when env doesn't override
         assert cfg.preview_max_chars == 400
+
+    def test_yaml_per_category_preview_caps(self, tmp_path):
+        if not _has_yaml():
+            pytest.skip("pyyaml not installed")
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "preview_max_chars: 1200\n"
+            "tool_input_preview_max_chars: 800\n"
+            "tool_output_preview_max_chars: 4000\n"
+            "llm_input_preview_max_chars: 600\n"
+            "llm_output_preview_max_chars: 600\n"
+        )
+        cfg = load_config(path=path)
+        assert cfg.preview_max_chars == 1200
+        assert cfg.tool_input_preview_max_chars == 800
+        assert cfg.tool_output_preview_max_chars == 4000
+        assert cfg.llm_input_preview_max_chars == 600
+        assert cfg.llm_output_preview_max_chars == 600
 
     def test_yaml_without_file_uses_defaults(self, tmp_path):
         cfg = load_config(path=tmp_path / "missing.yaml")

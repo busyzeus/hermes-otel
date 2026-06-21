@@ -342,7 +342,12 @@ enabled: true
 sample_rate: 0.25               # ParentBased(TraceIdRatioBased) — null/omit = sample everything
 root_span_ttl_ms: 600000        # orphan-sweep threshold (10 min default)
 flush_interval_ms: 60000        # metrics export cadence
-preview_max_chars: 1200         # clip_preview truncation limit
+preview_max_chars: 1200         # global clip_preview truncation fallback
+# Per-category overrides (each defaults to preview_max_chars when unset)
+tool_input_preview_max_chars: 1200
+tool_output_preview_max_chars: 2000
+llm_input_preview_max_chars: 1200
+llm_output_preview_max_chars: 1200
 capture_previews: true          # false = suppress all input.value / output.value
 capture_sender_id: false        # true = add platform-prefixed user.id to spans
 project_name: hermes-prod       # supersedes OTEL_PROJECT_NAME
@@ -364,6 +369,10 @@ Every field can be overridden by env var with prefix `HERMES_OTEL_` (scalars onl
 | `root_span_ttl_ms` | `HERMES_OTEL_ROOT_SPAN_TTL_MS` |
 | `flush_interval_ms` | `HERMES_OTEL_FLUSH_INTERVAL_MS` |
 | `preview_max_chars` | `HERMES_OTEL_PREVIEW_MAX_CHARS` |
+| `tool_input_preview_max_chars` | `HERMES_OTEL_TOOL_INPUT_PREVIEW_MAX_CHARS` |
+| `tool_output_preview_max_chars` | `HERMES_OTEL_TOOL_OUTPUT_PREVIEW_MAX_CHARS` |
+| `llm_input_preview_max_chars` | `HERMES_OTEL_LLM_INPUT_PREVIEW_MAX_CHARS` |
+| `llm_output_preview_max_chars` | `HERMES_OTEL_LLM_OUTPUT_PREVIEW_MAX_CHARS` |
 | `capture_previews` | `HERMES_OTEL_CAPTURE_PREVIEWS` |
 | `capture_sender_id` | `HERMES_OTEL_CAPTURE_SENDER_ID` |
 | `project_name` | `HERMES_OTEL_PROJECT_NAME` |

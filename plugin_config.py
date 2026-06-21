@@ -75,8 +75,14 @@ class HermesOtelConfig:
     sample_rate: Optional[float] = None  # None = AlwaysOn. 0..1 = ratio.
     root_span_ttl_ms: int = 600_000  # 10 min orphan sweep threshold
     flush_interval_ms: int = 60_000  # metrics export interval
-    preview_max_chars: int = 1200  # clip_preview truncation
+    preview_max_chars: int = 1200  # global clip_preview truncation fallback
     capture_previews: bool = True  # global privacy kill switch
+    # Per-category overrides — when set, each takes precedence over preview_max_chars
+    # for its specific span type. None = fall back to preview_max_chars.
+    tool_input_preview_max_chars: Optional[int] = None
+    tool_output_preview_max_chars: Optional[int] = None
+    llm_input_preview_max_chars: Optional[int] = None
+    llm_output_preview_max_chars: Optional[int] = None
     headers: Optional[Dict[str, str]] = None  # extra OTLP headers (all backends)
     global_tags: Optional[Dict[str, Scalar]] = None
     resource_attributes: Optional[Dict[str, Scalar]] = None
@@ -276,6 +282,10 @@ def _coerce_from_yaml(key: str, value: Any) -> Any:
         "root_span_ttl_ms",
         "flush_interval_ms",
         "preview_max_chars",
+        "tool_input_preview_max_chars",
+        "tool_output_preview_max_chars",
+        "llm_input_preview_max_chars",
+        "llm_output_preview_max_chars",
         "span_batch_max_queue_size",
         "span_batch_schedule_delay_ms",
         "span_batch_max_export_batch_size",
@@ -319,6 +329,10 @@ def _load_env_overrides() -> Dict[str, Any]:
     take("root_span_ttl_ms", _parse_int)
     take("flush_interval_ms", _parse_int)
     take("preview_max_chars", _parse_int)
+    take("tool_input_preview_max_chars", _parse_int)
+    take("tool_output_preview_max_chars", _parse_int)
+    take("llm_input_preview_max_chars", _parse_int)
+    take("llm_output_preview_max_chars", _parse_int)
     take("capture_previews", _parse_bool)
     take("span_batch_max_queue_size", _parse_int)
     take("span_batch_schedule_delay_ms", _parse_int)

@@ -212,13 +212,12 @@ def _detect_session_kind(platform: str, kwargs: dict) -> str:
     return "session"
 
 
-def _preview(value: Any, max_len: int) -> Optional[str]:
+def _preview(value: Any, max_chars: int) -> Optional[str]:
     """Apply the configured preview policy: capture toggle + clip_preview."""
     tracer = get_tracer()
     if not tracer.config.capture_previews:
         return None
-    cap = min(max_len, tracer.config.preview_max_chars)
-    return clip_preview(value, cap)
+    return clip_preview(value, max_chars)
 
 
 def _sender_attributes(sender_id: str, platform: str) -> Dict[str, str]:
@@ -515,7 +514,10 @@ def on_pre_tool_call(tool_name: str, args: dict, task_id: str, **kwargs):
     attributes: Dict[str, Any] = {
         "tool.name": tool_name,
     }
-    preview = _preview(json.dumps(args) if args else "{}", 500)
+    preview = _preview(
+        json.dumps(args) if args else "{}",
+        tracer.config.tool_input_preview_max_chars or tracer.config.preview_max_chars,
+    )
     if preview is not None:
         attributes["input.value"] = preview
 
@@ -597,7 +599,10 @@ def on_post_tool_call(tool_name: str, args: dict, result: str, task_id: str, **k
             attributes["error.message"] = error_msg
 
     # OpenInference output value — Phoenix shows this in Info
-    preview = _preview(result, 2000)
+    preview = _preview(
+        result,
+        tracer.config.tool_output_preview_max_chars or tracer.config.preview_max_chars,
+    )
     if preview is not None:
         attributes["output.value"] = preview
 
@@ -656,7 +661,13 @@ def on_pre_llm_call(
     if session_id:
         ps = tracer.sessions.get_or_create(session_id)
         if not ps.io_captured:
-            ps.io["input"] = _preview(user_message, 500) or ""
+            ps.io["input"] = (
+                _preview(
+                    user_message,
+                    tracer.config.llm_input_preview_max_chars or tracer.config.preview_max_chars,
+                )
+                or ""
+            )
             ps.io_captured = True
 
     # OpenInference attributes — Phoenix Info panel
@@ -692,11 +703,17 @@ def on_pre_llm_call(
             attributes["input.mime_type"] = "application/json"
             attributes["hermes.conversation.message_count"] = len(conversation_history)
         else:
-            preview = _preview(user_message, 500)
+            preview = _preview(
+                user_message,
+                tracer.config.llm_input_preview_max_chars or tracer.config.preview_max_chars,
+            )
             if preview is not None:
                 attributes["input.value"] = preview
     else:
-        preview = _preview(user_message, 500)
+        preview = _preview(
+            user_message,
+            tracer.config.llm_input_preview_max_chars or tracer.config.preview_max_chars,
+        )
         if preview is not None:
             attributes["input.value"] = preview
 
@@ -739,7 +756,13 @@ def on_post_llm_call(
     if session_id:
         ps = tracer.sessions.peek(session_id)
         if ps is not None and ps.io_captured:
-            ps.io["output"] = _preview(assistant_response, 500) or ""
+            ps.io["output"] = (
+                _preview(
+                    assistant_response,
+                    tracer.config.llm_output_preview_max_chars or tracer.config.preview_max_chars,
+                )
+                or ""
+            )
 
     tracer.record_metric(
         "message_count", 1, {"session_id": session_id, "model": model, "provider": platform}
@@ -751,7 +774,10 @@ def on_post_llm_call(
         "session_id": truncate_string(session_id, 200),
     }
     attributes.update(_correlation_attributes(tracer, session_id, kwargs))
-    preview = _preview(assistant_response, 500)
+    preview = _preview(
+        assistant_response,
+        tracer.config.llm_output_preview_max_chars or tracer.config.preview_max_chars,
+    )
     if preview is not None:
         attributes["output.value"] = preview
 

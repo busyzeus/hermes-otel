@@ -486,6 +486,79 @@ class TestOnPostLlmCall:
         disabled_tracer.end_span.assert_not_called()
 
 
+class TestPerCategoryPreviewCaps:
+    """preview_max_chars is the sole governor; per-category fields override it."""
+
+    def test_tool_input_cap_governs(self, mock_tracer):
+        from hermes_otel.plugin_config import HermesOtelConfig
+
+        mock_tracer.config = HermesOtelConfig(tool_input_preview_max_chars=10)
+        on_pre_tool_call(tool_name="bash", args={"cmd": "x" * 200}, task_id="t1")
+        attrs = mock_tracer.start_span.call_args[1]["attributes"]
+        assert len(attrs["input.value"]) <= 10
+
+    def test_tool_output_cap_governs(self, mock_tracer):
+        from hermes_otel.plugin_config import HermesOtelConfig
+
+        mock_tracer.config = HermesOtelConfig(tool_output_preview_max_chars=15)
+        mock_tracer.sessions.record_tool_start("bash:t1", 1000.0)
+        on_post_tool_call(tool_name="bash", args={}, result="y" * 200, task_id="t1")
+        attrs = mock_tracer.end_span.call_args[1]["attributes"]
+        assert len(attrs["output.value"]) <= 15
+
+    def test_llm_input_cap_governs(self, mock_tracer):
+        from hermes_otel.plugin_config import HermesOtelConfig
+
+        mock_tracer.config = HermesOtelConfig(llm_input_preview_max_chars=20)
+        on_pre_llm_call(
+            session_id="s1",
+            user_message="u" * 300,
+            conversation_history=[],
+            model="m",
+            platform="cli",
+            is_first_turn=True,
+        )
+        attrs = mock_tracer.start_span.call_args[1]["attributes"]
+        assert len(attrs["input.value"]) <= 20
+
+    def test_llm_output_cap_governs(self, mock_tracer):
+        from hermes_otel.plugin_config import HermesOtelConfig
+
+        mock_tracer.config = HermesOtelConfig(llm_output_preview_max_chars=12)
+        on_post_llm_call(
+            session_id="s1",
+            user_message="hi",
+            assistant_response="r" * 300,
+            conversation_history=[],
+            model="m",
+            platform="cli",
+        )
+        attrs = mock_tracer.end_span.call_args[1]["attributes"]
+        assert len(attrs["output.value"]) <= 12
+
+    def test_preview_max_chars_fallback_when_specific_unset(self, mock_tracer):
+        from hermes_otel.plugin_config import HermesOtelConfig
+
+        mock_tracer.config = HermesOtelConfig(preview_max_chars=25)
+        on_pre_tool_call(tool_name="bash", args={"cmd": "z" * 200}, task_id="t2")
+        attrs = mock_tracer.start_span.call_args[1]["attributes"]
+        assert len(attrs["input.value"]) <= 25
+
+    def test_specific_cap_exceeds_global(self, mock_tracer):
+        """A per-category cap larger than preview_max_chars is honored."""
+        from hermes_otel.plugin_config import HermesOtelConfig
+
+        mock_tracer.config = HermesOtelConfig(
+            preview_max_chars=50, tool_output_preview_max_chars=5000
+        )
+        mock_tracer.sessions.record_tool_start("bash:t3", 1000.0)
+        long_result = "w" * 200
+        on_post_tool_call(tool_name="bash", args={}, result=long_result, task_id="t3")
+        attrs = mock_tracer.end_span.call_args[1]["attributes"]
+        # Should be 200 (full), not clipped to 50
+        assert len(attrs["output.value"]) == 200
+
+
 class TestOnPreApiRequest:
     def test_creates_api_span(self, mock_tracer):
         on_pre_api_request(
