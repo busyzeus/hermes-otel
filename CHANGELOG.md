@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/briancaffey/hermes-otel/compare/hermes-otel-v0.5.0...hermes-otel-v0.6.0) (2026-06-21)
+
+
+### Features
+
+* **config:** apply per-category preview_max_chars truncation limits ([f181591](https://github.com/briancaffey/hermes-otel/commit/f181591a323c55b80ee54d276c5c9132734b7473))
+* **config:** apply per-category preview_max_chars truncation limits ([4688201](https://github.com/briancaffey/hermes-otel/commit/46882013b7db69fd454d00cbe87d0b064a157c3b))
+
 ## [0.5.0](https://github.com/briancaffey/hermes-otel/compare/hermes-otel-v0.4.0...hermes-otel-v0.5.0) (2026-06-07)
 
 
