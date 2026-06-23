@@ -20,9 +20,9 @@ ACTION="${1:-up}"
 
 STACKS=(
   "phoenix|docker-compose/phoenix.yaml"
-  "langfuse|docker-compose/langfuse.yaml"
-  "jaeger|docker-compose/jaeger.yaml"
-  "signoz|docker-compose/signoz/docker-compose.yaml"
+#  "langfuse|docker-compose/langfuse.yaml"
+#  "jaeger|docker-compose/jaeger.yaml"
+#  "signoz|docker-compose/signoz/docker-compose.yaml"
   # LGTM is intentionally commented out of "up all" because it collides
   # with phoenix (port 3000) and langfuse (port 3000) and with jaeger
   # (port 4318). Bring it up standalone:

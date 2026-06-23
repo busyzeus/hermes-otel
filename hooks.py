@@ -55,6 +55,7 @@ def _install_httpx_interceptor():
             if body:
                 with _httpx_lock:
                     _httpx_bodies[tname] = {"request": body.decode("utf-8", errors="replace")}
+                debug_log(f"httpx interceptor: captured request {len(body)} chars [thread={tname}]")
         except Exception:
             pass
         response = _orig_send(self, request, *args, **kwargs)
@@ -65,6 +66,7 @@ def _install_httpx_interceptor():
                     entry = _httpx_bodies.get(tname, {})
                     entry["response"] = body
                     _httpx_bodies[tname] = entry
+                debug_log(f"httpx interceptor: captured response {len(body)} chars")
         except Exception:
             pass
         return response
@@ -76,6 +78,7 @@ def _install_httpx_interceptor():
             if body:
                 with _httpx_lock:
                     _httpx_bodies[tname] = {"request": body.decode("utf-8", errors="replace")}
+                debug_log(f"httpx interceptor (async): captured request {len(body)} chars [thread={tname}]")
         except Exception:
             pass
         response = await _orig_async_send(self, request, *args, **kwargs)
@@ -86,6 +89,7 @@ def _install_httpx_interceptor():
                     entry = _httpx_bodies.get(tname, {})
                     entry["response"] = body
                     _httpx_bodies[tname] = entry
+                debug_log(f"httpx interceptor (async): captured response {len(body)} chars")
         except Exception:
             pass
         return response
@@ -1026,6 +1030,7 @@ def on_post_api_request(
                 req_body = entry["request"]
             if "response" in entry:
                 resp_body = entry["response"]
+        debug_log(f"  httpx capture: req_body={bool(req_body)} ({len(req_body) if req_body else 0} chars), resp_body={bool(resp_body)} ({len(resp_body) if resp_body else 0} chars)")
         _httpx_bodies.clear()
     if req_body and tracer.config.capture_full_prompts:
         try:
@@ -1035,9 +1040,11 @@ def on_post_api_request(
                 attributes["llm.input_messages"] = text
                 attributes["input.value"] = text
                 attributes["input.mime_type"] = "application/json"
+                debug_log(f"  httpx capture: set llm.input_messages ({len(text)} chars)")
             if "tools" in parsed:
                 attributes["llm.request.tools"] = json.dumps(parsed["tools"], ensure_ascii=False)
         except Exception as e:
+            debug_log(f"  httpx capture: request parse error: {e}")
 
     if resp_body and tracer.config.capture_full_responses:
         try:
@@ -1050,12 +1057,15 @@ def on_post_api_request(
                     attributes["llm.output.content"] = str(content)
                     attributes["output.value"] = str(content)
                     attributes["output.mime_type"] = "text/plain"
+                    debug_log(f"  httpx capture: set llm.output.content ({len(str(content))} chars)")
                 if tool_calls and not attributes.get("llm.output.tool_calls"):
                     attributes["llm.output.tool_calls"] = json.dumps(tool_calls, ensure_ascii=False)
                     if not attributes.get("output.value"):
                         attributes["output.value"] = json.dumps(tool_calls, ensure_ascii=False)
                         attributes["output.mime_type"] = "application/json"
+                    debug_log(f"  httpx capture: set llm.output.tool_calls ({len(tool_calls)} calls)")
         except Exception as e:
+            debug_log(f"  httpx capture: response parse error: {e}")
 
     # Pop parent
     tracer.spans.pop_parent(session_id=session_id)
