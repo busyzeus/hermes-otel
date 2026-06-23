@@ -12,6 +12,7 @@ routed through the tracer singleton so test reset is just
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -25,6 +26,74 @@ from .helpers import (
 )
 from .session_state import TurnSummary
 from .tracer import get_tracer
+
+# Thread-local storage for httpx-intercepted request/response bodies.
+# Patched once when the first API span is created.
+# Store captured HTTP bodies keyed by thread name (avoids race conditions)
+_httpx_patched = False
+_httpx_bodies = {}  # thread_name -> {"request": ..., "response": ...}
+_httpx_lock = threading.Lock()
+
+
+def _install_httpx_interceptor():
+    """Monkey-patch httpx to capture request/response bodies in thread-local storage."""
+    global _httpx_patched
+    if _httpx_patched:
+        return
+    try:
+        import httpx
+    except ImportError:
+        return
+
+    _orig_send = httpx.Client.send
+    _orig_async_send = httpx.AsyncClient.send
+
+    def _patched_send(self, request, *args, **kwargs):
+        tname = threading.current_thread().name
+        try:
+            body = request.read()
+            if body:
+                with _httpx_lock:
+                    _httpx_bodies[tname] = {"request": body.decode("utf-8", errors="replace")}
+        except Exception:
+            pass
+        response = _orig_send(self, request, *args, **kwargs)
+        try:
+            body = response.text
+            if body:
+                with _httpx_lock:
+                    entry = _httpx_bodies.get(tname, {})
+                    entry["response"] = body
+                    _httpx_bodies[tname] = entry
+        except Exception:
+            pass
+        return response
+
+    async def _patched_async_send(self, request, *args, **kwargs):
+        tname = threading.current_thread().name
+        try:
+            body = request.read()
+            if body:
+                with _httpx_lock:
+                    _httpx_bodies[tname] = {"request": body.decode("utf-8", errors="replace")}
+        except Exception:
+            pass
+        response = await _orig_async_send(self, request, *args, **kwargs)
+        try:
+            body = response.text
+            if body:
+                with _httpx_lock:
+                    entry = _httpx_bodies.get(tname, {})
+                    entry["response"] = body
+                    _httpx_bodies[tname] = entry
+        except Exception:
+            pass
+        return response
+
+    httpx.Client.send = _patched_send
+    httpx.AsyncClient.send = _patched_async_send
+    _httpx_patched = True
+    debug_log("httpx interceptor installed")
 
 
 class HookContext(TypedDict, total=False):
@@ -812,6 +881,9 @@ def on_pre_api_request(
     if not tracer.is_enabled:
         return
 
+    # Install httpx interceptor so we capture the actual HTTP body
+    _install_httpx_interceptor()
+
     tracer.sweep_expired_turns()
 
     key = f"api:{task_id}"
@@ -943,6 +1015,47 @@ def on_post_api_request(
             if not response_content:
                 attributes["output.value"] = tool_calls_serialized
                 attributes["output.mime_type"] = "application/json"
+
+    # Capture full HTTP request/response bodies from the httpx interceptor.
+    # Grab the most recent capture from any thread.
+    req_body = None
+    resp_body = None
+    with _httpx_lock:
+        for tname, entry in _httpx_bodies.items():
+            if "request" in entry:
+                req_body = entry["request"]
+            if "response" in entry:
+                resp_body = entry["response"]
+        _httpx_bodies.clear()
+    if req_body and tracer.config.capture_full_prompts:
+        try:
+            parsed = json.loads(req_body)
+            if "messages" in parsed:
+                text = json.dumps(parsed["messages"], ensure_ascii=False)
+                attributes["llm.input_messages"] = text
+                attributes["input.value"] = text
+                attributes["input.mime_type"] = "application/json"
+            if "tools" in parsed:
+                attributes["llm.request.tools"] = json.dumps(parsed["tools"], ensure_ascii=False)
+        except Exception as e:
+
+    if resp_body and tracer.config.capture_full_responses:
+        try:
+            parsed = json.loads(resp_body)
+            if "choices" in parsed:
+                msg = parsed["choices"][0].get("message", {})
+                content = msg.get("content", "")
+                tool_calls = msg.get("tool_calls", [])
+                if content and not attributes.get("llm.output.content"):
+                    attributes["llm.output.content"] = str(content)
+                    attributes["output.value"] = str(content)
+                    attributes["output.mime_type"] = "text/plain"
+                if tool_calls and not attributes.get("llm.output.tool_calls"):
+                    attributes["llm.output.tool_calls"] = json.dumps(tool_calls, ensure_ascii=False)
+                    if not attributes.get("output.value"):
+                        attributes["output.value"] = json.dumps(tool_calls, ensure_ascii=False)
+                        attributes["output.mime_type"] = "application/json"
+        except Exception as e:
 
     # Pop parent
     tracer.spans.pop_parent(session_id=session_id)
