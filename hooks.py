@@ -35,8 +35,107 @@ _httpx_bodies = {}  # thread_name -> {"request": ..., "response": ...}
 _httpx_lock = threading.Lock()
 
 
+def _parse_sse_response(text: str) -> str | None:
+    """Parse SSE (Server-Sent Events) streaming response into a JSON response.
+
+    Reconstructs the full message from delta chunks, returning a JSON string
+    that looks like a non-streaming OpenAI-compatible response.
+    Returns None if the text doesn't look like SSE.
+    """
+    if not text or not text.lstrip().startswith("data:"):
+        return None
+
+    content_parts: list[str] = []
+    tool_calls_by_index: dict[int, dict] = {}
+    finish_reason = "stop"
+    model = ""
+    usage = {}
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped or not stripped.startswith("data:"):
+            continue
+        data_str = stripped[5:].strip()  # Remove "data:" prefix
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        model = chunk.get("model", model) or model
+        usage = chunk.get("usage", usage) or usage
+
+        for choice in chunk.get("choices", []):
+            finish_reason = choice.get("finish_reason") or finish_reason
+            delta = choice.get("delta", {})
+
+            # Accumulate text content
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+
+            # Accumulate tool calls (merge by index)
+            for tc in delta.get("tool_calls", []):
+                idx = tc.get("index", 0)
+                if idx not in tool_calls_by_index:
+                    tool_calls_by_index[idx] = {
+                        "id": tc.get("id", ""),
+                        "function": {"name": "", "arguments": ""},
+                    }
+                entry = tool_calls_by_index[idx]
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                fn = tc.get("function", {})
+                if fn.get("name"):
+                    entry["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    entry["function"]["arguments"] += fn["arguments"]
+
+    # Build reconstructed message
+    message: dict = {}
+    if content_parts:
+        message["content"] = "".join(content_parts)
+    if tool_calls_by_index:
+        message["tool_calls"] = [
+            tool_calls_by_index[i] for i in sorted(tool_calls_by_index)
+        ]
+
+    if not message:
+        return None
+
+    result: dict = {
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }]
+    }
+    if model:
+        result["model"] = model
+    if usage:
+        result["usage"] = usage
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _capture_response(tname: str, body_text: str) -> None:
+    """Store a captured response body, converting SSE streams to JSON."""
+    entry = _httpx_bodies.get(tname, {})
+    entry["response"] = body_text
+    # Always store the raw body, but also store a parsed version for SSE
+    sse_parsed = _parse_sse_response(body_text)
+    if sse_parsed is not None:
+        entry["response_sse_parsed"] = sse_parsed
+    _httpx_bodies[tname] = entry
+
+
 def _install_httpx_interceptor():
-    """Monkey-patch httpx to capture request/response bodies in thread-local storage."""
+    """Monkey-patch httpx to capture request/response bodies in thread-local storage.
+
+    Reads the full response body immediately after ``_orig_send`` returns
+    and returns a new ``httpx.Response`` with the buffered content so the
+    caller can still consume it. This guarantees every response is captured
+    regardless of whether the caller uses streaming.
+    """
     global _httpx_patched
     if _httpx_patched:
         return
@@ -58,18 +157,38 @@ def _install_httpx_interceptor():
                 debug_log(f"httpx interceptor: captured request {len(body)} chars [thread={tname}]")
         except Exception:
             pass
+
         response = _orig_send(self, request, *args, **kwargs)
+
+        # Buffer the full response body immediately.  ``response.text`` reads
+        # the entire stream (blocking if streaming), and then we re-wrap it
+        # into a new Response so the caller can still consume it.
+        resp_body_bytes = b""
+        resp_body_text = ""
         try:
-            body = response.text
-            if body:
-                with _httpx_lock:
-                    entry = _httpx_bodies.get(tname, {})
-                    entry["response"] = body
-                    _httpx_bodies[tname] = entry
-                debug_log(f"httpx interceptor: captured response {len(body)} chars")
-        except Exception:
-            pass
-        return response
+            resp_body_bytes = response.read()
+            resp_body_text = resp_body_bytes.decode("utf-8", errors="replace")
+        except Exception as e:
+            debug_log(f"httpx interceptor: error reading response body: {e}")
+
+        if resp_body_text:
+            with _httpx_lock:
+                _capture_response(tname, resp_body_text)
+            is_sse = resp_body_text.lstrip().startswith("data:")
+            debug_log(
+                f"httpx interceptor: captured response {len(resp_body_text)} chars"
+                + (" [SSE parsed]" if is_sse and _parse_sse_response(resp_body_text) else "")
+            )
+
+        # Return a new Response with the buffered content so the caller can
+        # still read it (otherwise the body would be consumed).
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=resp_body_bytes,
+            request=response.request,
+            extensions=response.extensions,
+        )
 
     async def _patched_async_send(self, request, *args, **kwargs):
         tname = threading.current_thread().name
@@ -81,18 +200,34 @@ def _install_httpx_interceptor():
                 debug_log(f"httpx interceptor (async): captured request {len(body)} chars [thread={tname}]")
         except Exception:
             pass
+
         response = await _orig_async_send(self, request, *args, **kwargs)
+
+        # Buffer the full response body immediately.
+        resp_body_bytes = b""
+        resp_body_text = ""
         try:
-            body = response.text
-            if body:
-                with _httpx_lock:
-                    entry = _httpx_bodies.get(tname, {})
-                    entry["response"] = body
-                    _httpx_bodies[tname] = entry
-                debug_log(f"httpx interceptor (async): captured response {len(body)} chars")
-        except Exception:
-            pass
-        return response
+            resp_body_bytes = await response.aread()
+            resp_body_text = resp_body_bytes.decode("utf-8", errors="replace")
+        except Exception as e:
+            debug_log(f"httpx interceptor (async): error reading response body: {e}")
+
+        if resp_body_text:
+            with _httpx_lock:
+                _capture_response(tname, resp_body_text)
+            is_sse = resp_body_text.lstrip().startswith("data:")
+            debug_log(
+                f"httpx interceptor (async): captured response {len(resp_body_text)} chars"
+                + (" [SSE parsed]" if is_sse and _parse_sse_response(resp_body_text) else "")
+            )
+
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=resp_body_bytes,
+            request=response.request,
+            extensions=response.extensions,
+        )
 
     httpx.Client.send = _patched_send
     httpx.AsyncClient.send = _patched_async_send
@@ -1024,13 +1159,23 @@ def on_post_api_request(
     # Grab the most recent capture from any thread.
     req_body = None
     resp_body = None
+    resp_sse_parsed = None
     with _httpx_lock:
         for tname, entry in _httpx_bodies.items():
             if "request" in entry:
                 req_body = entry["request"]
-            if "response" in entry:
+            if "response_sse_parsed" in entry:
+                resp_sse_parsed = entry["response_sse_parsed"]
+                resp_body = entry.get("response", resp_body)
+            elif "response" in entry:
                 resp_body = entry["response"]
-        debug_log(f"  httpx capture: req_body={bool(req_body)} ({len(req_body) if req_body else 0} chars), resp_body={bool(resp_body)} ({len(resp_body) if resp_body else 0} chars)")
+        debug_log(
+            f"  httpx capture: req_body={bool(req_body)}"
+            f" ({len(req_body) if req_body else 0} chars),"
+            f" resp_body={bool(resp_body)}"
+            f" ({len(resp_body) if resp_body else 0} chars),"
+            f" sse_parsed={bool(resp_sse_parsed)}"
+        )
         _httpx_bodies.clear()
     if req_body and tracer.config.capture_full_prompts:
         try:
@@ -1046,9 +1191,11 @@ def on_post_api_request(
         except Exception as e:
             debug_log(f"  httpx capture: request parse error: {e}")
 
-    if resp_body and tracer.config.capture_full_responses:
+    # Try SSE-parsed response first, then fall back to raw response body.
+    response_body_to_parse = resp_sse_parsed or resp_body
+    if response_body_to_parse and tracer.config.capture_full_responses:
         try:
-            parsed = json.loads(resp_body)
+            parsed = json.loads(response_body_to_parse)
             if "choices" in parsed:
                 msg = parsed["choices"][0].get("message", {})
                 content = msg.get("content", "")
