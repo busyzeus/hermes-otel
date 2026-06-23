@@ -67,6 +67,7 @@ dev = [
     "pyyaml",
     "black",
     "ruff",
+    "httpx",  # exercise the httpx body-capture interceptor in unit tests
     "opentelemetry-api",
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp-proto-http",

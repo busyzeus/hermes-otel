@@ -96,19 +96,19 @@ def _parse_sse_response(text: str) -> str | None:
     if content_parts:
         message["content"] = "".join(content_parts)
     if tool_calls_by_index:
-        message["tool_calls"] = [
-            tool_calls_by_index[i] for i in sorted(tool_calls_by_index)
-        ]
+        message["tool_calls"] = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
 
     if not message:
         return None
 
     result: dict = {
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }]
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ]
     }
     if model:
         result["model"] = model
@@ -118,7 +118,10 @@ def _parse_sse_response(text: str) -> str | None:
 
 
 def _capture_response(tname: str, body_text: str) -> None:
-    """Store a captured response body, converting SSE streams to JSON."""
+    """Store a captured response body, converting SSE streams to JSON.
+
+    Must be called while holding ``_httpx_lock`` (it does not acquire it).
+    """
     entry = _httpx_bodies.get(tname, {})
     entry["response"] = body_text
     # Always store the raw body, but also store a parsed version for SSE
@@ -128,6 +131,25 @@ def _capture_response(tname: str, body_text: str) -> None:
     _httpx_bodies[tname] = entry
 
 
+def _take_captured_bodies(tname: str) -> dict:
+    """Pop the captured HTTP bodies for ``tname`` (usually the current thread).
+
+    The post-API hook does not always run on the thread that issued the httpx
+    call, so this falls back to the most-recently-captured entry from any
+    thread when ``tname`` has none. Only the consumed entry is removed —
+    captures from other in-flight requests on other threads are preserved
+    rather than wiped, which avoids cross-attributing one request's body to
+    another span under concurrency.
+    """
+    with _httpx_lock:
+        entry = _httpx_bodies.pop(tname, None)
+        if entry is None and _httpx_bodies:
+            # dict preserves insertion order: the last key is the newest capture.
+            last_key = next(reversed(_httpx_bodies))
+            entry = _httpx_bodies.pop(last_key)
+        return entry or {}
+
+
 def _install_httpx_interceptor():
     """Monkey-patch httpx to capture request/response bodies in thread-local storage.
 
@@ -135,6 +157,11 @@ def _install_httpx_interceptor():
     and returns a new ``httpx.Response`` with the buffered content so the
     caller can still consume it. This guarantees every response is captured
     regardless of whether the caller uses streaming.
+
+    Trade-off: buffering the whole body defeats incremental streaming (the
+    caller receives the response only once it is complete). Callers therefore
+    install this **only** when a full-body capture flag is enabled — see
+    ``on_pre_api_request`` — so the default path never patches httpx.
     """
     global _httpx_patched
     if _httpx_patched:
@@ -170,6 +197,14 @@ def _install_httpx_interceptor():
             resp_body_text = resp_body_bytes.decode("utf-8", errors="replace")
         except Exception as e:
             debug_log(f"httpx interceptor: error reading response body: {e}")
+        finally:
+            # We've buffered the body; release the original response so the
+            # underlying connection returns to the pool (matters for the
+            # streaming path where the caller never closes it itself).
+            try:
+                response.close()
+            except Exception:
+                pass
 
         if resp_body_text:
             with _httpx_lock:
@@ -197,7 +232,9 @@ def _install_httpx_interceptor():
             if body:
                 with _httpx_lock:
                     _httpx_bodies[tname] = {"request": body.decode("utf-8", errors="replace")}
-                debug_log(f"httpx interceptor (async): captured request {len(body)} chars [thread={tname}]")
+                debug_log(
+                    f"httpx interceptor (async): captured request {len(body)} chars [thread={tname}]"
+                )
         except Exception:
             pass
 
@@ -211,6 +248,11 @@ def _install_httpx_interceptor():
             resp_body_text = resp_body_bytes.decode("utf-8", errors="replace")
         except Exception as e:
             debug_log(f"httpx interceptor (async): error reading response body: {e}")
+        finally:
+            try:
+                await response.aclose()
+            except Exception:
+                pass
 
         if resp_body_text:
             with _httpx_lock:
@@ -1020,8 +1062,11 @@ def on_pre_api_request(
     if not tracer.is_enabled:
         return
 
-    # Install httpx interceptor so we capture the actual HTTP body
-    _install_httpx_interceptor()
+    # Install the httpx interceptor only when full-body capture is opted into.
+    # It buffers each response in full (see its docstring), which defeats
+    # incremental streaming — so the default path leaves httpx untouched.
+    if tracer.config.capture_full_prompts or tracer.config.capture_full_responses:
+        _install_httpx_interceptor()
 
     tracer.sweep_expired_turns()
 
@@ -1156,27 +1201,19 @@ def on_post_api_request(
                 attributes["output.mime_type"] = "application/json"
 
     # Capture full HTTP request/response bodies from the httpx interceptor.
-    # Grab the most recent capture from any thread.
-    req_body = None
-    resp_body = None
-    resp_sse_parsed = None
-    with _httpx_lock:
-        for tname, entry in _httpx_bodies.items():
-            if "request" in entry:
-                req_body = entry["request"]
-            if "response_sse_parsed" in entry:
-                resp_sse_parsed = entry["response_sse_parsed"]
-                resp_body = entry.get("response", resp_body)
-            elif "response" in entry:
-                resp_body = entry["response"]
-        debug_log(
-            f"  httpx capture: req_body={bool(req_body)}"
-            f" ({len(req_body) if req_body else 0} chars),"
-            f" resp_body={bool(resp_body)}"
-            f" ({len(resp_body) if resp_body else 0} chars),"
-            f" sse_parsed={bool(resp_sse_parsed)}"
-        )
-        _httpx_bodies.clear()
+    # Consume only this thread's capture (falling back to the most recent),
+    # leaving any other in-flight threads' captures intact.
+    entry = _take_captured_bodies(threading.current_thread().name)
+    req_body = entry.get("request")
+    resp_body = entry.get("response")
+    resp_sse_parsed = entry.get("response_sse_parsed")
+    debug_log(
+        f"  httpx capture: req_body={bool(req_body)}"
+        f" ({len(req_body) if req_body else 0} chars),"
+        f" resp_body={bool(resp_body)}"
+        f" ({len(resp_body) if resp_body else 0} chars),"
+        f" sse_parsed={bool(resp_sse_parsed)}"
+    )
     if req_body and tracer.config.capture_full_prompts:
         try:
             parsed = json.loads(req_body)
@@ -1204,13 +1241,17 @@ def on_post_api_request(
                     attributes["llm.output.content"] = str(content)
                     attributes["output.value"] = str(content)
                     attributes["output.mime_type"] = "text/plain"
-                    debug_log(f"  httpx capture: set llm.output.content ({len(str(content))} chars)")
+                    debug_log(
+                        f"  httpx capture: set llm.output.content ({len(str(content))} chars)"
+                    )
                 if tool_calls and not attributes.get("llm.output.tool_calls"):
                     attributes["llm.output.tool_calls"] = json.dumps(tool_calls, ensure_ascii=False)
                     if not attributes.get("output.value"):
                         attributes["output.value"] = json.dumps(tool_calls, ensure_ascii=False)
                         attributes["output.mime_type"] = "application/json"
-                    debug_log(f"  httpx capture: set llm.output.tool_calls ({len(tool_calls)} calls)")
+                    debug_log(
+                        f"  httpx capture: set llm.output.tool_calls ({len(tool_calls)} calls)"
+                    )
         except Exception as e:
             debug_log(f"  httpx capture: response parse error: {e}")
 
